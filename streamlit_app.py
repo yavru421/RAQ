@@ -10,6 +10,7 @@ from typing import Optional, Callable, Dict
 import logging
 import time
 import pandas as pd
+from PIL import Image
 
 st.set_page_config(page_title="RAQ - Pure Groq", page_icon="🤖", layout="centered", initial_sidebar_state="collapsed")
 
@@ -89,6 +90,20 @@ def extract_text_from_txt(file):
     except Exception as e:
         st.error(f"Error reading TXT: {str(e)}")
         return ""
+
+# Add image Q&A support
+from PIL import Image
+
+def extract_image_bytes(file):
+    """Return image bytes if file is an image, else None."""
+    try:
+        file.seek(0)
+        img = Image.open(file)
+        img.verify()  # Verify it's an image
+        file.seek(0)
+        return file.read()
+    except Exception:
+        return None
 
 # Define a dictionary for text extractors
 text_extractors: Dict[str, Callable[[io.BytesIO], str]] = {
@@ -245,85 +260,112 @@ def initialize_groq_client(api_key: str) -> Optional[Groq]:
 def ask_groq_with_model(question: str, document_text: str, api_key: str, model: str) -> str:
     """Ask question using a specific Groq model with document context."""
     try:
-        # Split the document into chunks
-        max_tokens_per_chunk = 5000  # Adjust based on the model's token limit
+        max_tokens_per_chunk = 5000
         chunks = split_text_into_chunks(document_text, max_tokens_per_chunk)
-
         aggregated_response = ""
-
-        # Add a progress bar for chunk processing
         progress_bar = st.progress(0)
-
         for i, chunk in enumerate(chunks):
             logging.info(f"Processing chunk {i + 1}/{len(chunks)} with model {model}")
-
-            # Initialize Groq client with only the API key
             client = Groq(api_key=api_key)
-
-            # Create a comprehensive prompt with document context
-            prompt = f"""You are a helpful AI assistant. Answer the question based on the provided document context. If the answer cannot be found in the document, say so clearly.
-
-DOCUMENT CONTENT:
-{chunk}
-
-QUESTION: {question}
-
-Please provide a clear, accurate answer based on the document content above. If the information needed to answer the question is not in the document, please state that clearly."""
-
+            prompt = f"""You are a helpful AI assistant. Answer the question based on the provided document context. If the answer cannot be found in the document, say so clearly.\n\nDOCUMENT CONTENT:\n{chunk}\n\nQUESTION: {question}\n\nPlease provide a clear, accurate answer based on the document content above. If the information needed to answer the question is not in the document, please state that clearly."""
             retry_count = 0
-            max_retries = 5
+            max_retries = 10 if "compound-beta" in model else 5
             backoff_factor = 2
-            delay = 1  # Initial delay in seconds
-
-            # Updated retry logic for Compound Beta model
-            if "compound-beta" in model:
-                max_retries = 10  # Increase retries for Compound Beta
-                delay = 2  # Start with a slightly longer delay
-
+            delay = 2 if "compound-beta" in model else 1
             while retry_count < max_retries:
                 try:
                     response = client.chat.completions.create(
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": prompt
-                            }
-                        ],
+                        messages=[{"role": "user", "content": prompt}],
                         model=model,
                         max_tokens=1000,
                         temperature=0.1,
                     )
-
-                    # Safely append response content
                     if response.choices and response.choices[0].message.content:
                         aggregated_response += response.choices[0].message.content + "\n"
-
-                    break  # Exit retry loop on success
-
+                    break
                 except Exception as e:
-                    # Enhanced error message for rate limit
                     if "429 Too Many Requests" in str(e):
                         retry_count += 1
                         logging.info(f"Rate limit reached for model {model}. Retrying in {delay} seconds (Attempt {retry_count}/{max_retries})")
                         st.warning(f"Rate limit reached for model {model}. Retrying in {delay} seconds (Attempt {retry_count}/{max_retries})")
                         time.sleep(delay)
-                        delay *= backoff_factor  # Compound backoff
+                        delay *= backoff_factor
                     else:
                         logging.error(f"Error during Groq API call: {e}")
                         return f"Error: {str(e)}"
-
             if retry_count == max_retries:
                 logging.error("Max retries reached. Unable to process chunk.")
                 return "Error: Max retries reached. Unable to process chunk."
-
-            # Update progress bar
             progress_bar.progress((i + 1) / len(chunks))
-
         return aggregated_response.strip()
-
     except Exception as e:
         logging.error(f"Error during Groq API call: {e}")
         return f"Error: {str(e)}"
+
+# Move ask_groq_vision definition above the main UI logic so it is always defined before use.
+def ask_groq_vision(question: str, image_bytes: bytes, api_key: str, model: str = "meta-llama/llama-4-scout-17b-16e-instruct") -> str:
+    """Call Groq Vision API for image Q&A using base64-encoded image in message content. Model can be 'scout' or 'maverick'."""
+    import base64
+    from groq import Groq
+    # Encode image as base64
+    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    client = Groq(api_key=api_key)
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": question},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}",
+                            },
+                        },
+                    ],
+                }
+            ],
+            model=model,
+        )
+        return chat_completion.choices[0].message.content or "[No answer returned]"
+    except Exception as e:
+        return f"Groq Vision API error: {e}"
+
+# --- Universal Q&A handler ---
+def handle_upload_and_qa(uploaded_file, question, api_key):
+    """Automatically detect file type and use the correct model/API for Q&A."""
+    if not uploaded_file or not question or not api_key:
+        return None, None, None
+    file_extension = os.path.splitext(uploaded_file.name)[1].lower()
+    # Image types
+    if file_extension in [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"]:
+        image_bytes = extract_image_bytes(uploaded_file)
+        if image_bytes:
+            vision_model = "meta-llama/llama-4-scout-17b-16e-instruct"
+            answer = ask_groq_vision(question, image_bytes, api_key, model=vision_model)
+            return answer, vision_model, "image"
+        else:
+            return "Failed to read image file.", None, None
+    # Document types
+    elif file_extension in [".pdf", ".docx", ".pptx", ".txt"]:
+        document_text = process_document(uploaded_file)
+        if document_text:
+            answer = ask_groq(question, document_text, api_key)
+            return answer, "llama3-8b-8192", "text"
+        else:
+            return "Failed to extract text from document.", None, None
+    # Fallback: try as image, then as text
+    image_bytes = extract_image_bytes(uploaded_file)
+    if image_bytes:
+        vision_model = "meta-llama/llama-4-scout-17b-16e-instruct"
+        answer = ask_groq_vision(question, image_bytes, api_key, model=vision_model)
+        return answer, vision_model, "image"
+    document_text = process_document(uploaded_file)
+    if document_text:
+        answer = ask_groq(question, document_text, api_key)
+        return answer, "llama3-8b-8192", "text"
+    return "Unsupported file type or failed to process.", None, None
 
 # Initialize variables to avoid unbound errors
 summary = "No summary available."
@@ -352,8 +394,8 @@ if api_key:
 st.sidebar.header("📄 Document Upload")
 uploaded_file = st.sidebar.file_uploader(
     "Choose a file", 
-    type=['pdf', 'docx', 'pptx', 'txt'],
-    help="Upload PDF, DOCX, PPTX, or TXT files"
+    type=['pdf', 'docx', 'pptx', 'txt', 'jpg', 'jpeg', 'png'],
+    help="Upload PDF, DOCX, PPTX, TXT, or image files"
 )
 
 # Document type detection
@@ -368,6 +410,8 @@ if uploaded_file:
         document_type = "PowerPoint Presentation"
     elif file_extension in [".txt"]:
         document_type = "Text File"
+    elif file_extension in [".jpg", ".jpeg", ".png"]:
+        document_type = "Image"
     st.sidebar.info(f"📄 Detected Document Type: {document_type}")
 
 # Check file size limit
@@ -477,40 +521,26 @@ col1, col2 = st.columns([2, 1])
 
 with col1:
     st.header("💬 Ask Questions")
-    
     if not api_key:
         st.info("👈 Please enter your Groq API key in the sidebar to get started")
-    elif not st.session_state.document_text:
-        st.info("👈 Please upload a document in the sidebar first")
+    elif not uploaded_file:
+        st.info("👈 Please upload a document or image in the sidebar first")
     else:
-        # Question input
-        question = st.text_input(
-            "What would you like to know about the document?",
-        )
-        
-        # Quick question buttons
-        st.markdown("**Quick Questions:**")
-        col_q1, col_q2, col_q3 = st.columns(3)
-        
-        with col_q1:
-            if st.button("📝 Summarize", key="summarize_button"):
-                question = "Please provide a comprehensive summary of this document."
-        
-        with col_q2:
-            if st.button("🔍 Key Points", key="key_points_button"):
-                question = "What are the main key points or takeaways from this document?"
-        
-        with col_q3:
-            if st.button("❓ Main Topic", key="main_topic_button"):
-                question = "What is the main topic or subject of this document?"
-        
-        # Generate answer
-        if question and st.session_state.document_text and api_key:
-            with st.spinner("🤔 Thinking..."):
-                answer = ask_groq(question, st.session_state.document_text, api_key)
-            
-            st.markdown("### 💡 Answer:")
-            st.markdown(answer)
+        question = st.text_input("What would you like to know about the uploaded file?")
+        if question:
+            with st.spinner("🤔 Processing..."):
+                answer, used_model, file_type = handle_upload_and_qa(uploaded_file, question, api_key)
+            if file_type == "image":
+                st.markdown(f"### 👁️ Vision Q&A Answer ({used_model}):")
+                st.markdown(answer)
+                image_bytes = extract_image_bytes(uploaded_file)
+                if image_bytes:
+                    st.image(image_bytes, caption="Uploaded Image", use_container_width=True)
+            elif file_type == "text":
+                st.markdown(f"### 💡 Text Q&A Answer ({used_model}):")
+                st.markdown(answer)
+            else:
+                st.error(answer)
 
     # Move analysis results to the main body of the app
     st.markdown("### 📊 Analysis Results")
@@ -565,3 +595,34 @@ if selected_model:
             answer = ask_groq_with_model(question, st.session_state.document_text, api_key, selected_model)
         st.markdown("### 💡 Answer:")
         st.markdown(answer)
+
+# Refactor Vision Q&A capabilities into a dedicated function
+def vision_qa_section(api_key):
+    """Encapsulates Vision Q&A logic for image uploads and question answering."""
+    st.header("👁️ Vision Q&A")
+
+    # File uploader for Vision Q&A
+    vision_uploaded_file = st.file_uploader(
+        "Upload an image for Vision Q&A", 
+        type=['jpg', 'jpeg', 'png', 'bmp', 'gif', 'webp'],
+        help="Upload image files for Vision Q&A"
+    )
+
+    if vision_uploaded_file:
+        with st.spinner("📖 Processing image..."):
+            image_bytes = extract_image_bytes(vision_uploaded_file)
+            if image_bytes:
+                st.success("✅ Image uploaded successfully!")
+                question = st.text_input("What would you like to know about the image?")
+                if question:
+                    with st.spinner("🤔 Processing Vision Q&A..."):
+                        vision_model = "meta-llama/llama-4-scout-17b-16e-instruct"
+                        answer = ask_groq_vision(question, image_bytes, api_key, model=vision_model)
+                        st.markdown(f"### 👁️ Vision Q&A Answer ({vision_model}):")
+                        st.markdown(answer)
+                        st.image(image_bytes, caption="Uploaded Image", use_container_width=True)
+            else:
+                st.error("❌ Failed to read image file.")
+
+# Call the refactored Vision Q&A section in the main layout
+vision_qa_section(api_key)
